@@ -2,11 +2,13 @@
 
 ## Overview
 
-This document describes the stability and crash-resilience improvements made to the `dbt-fabricspark` adapter. These changes address runtime crashes, hangs, and resource leaks that occurred when running larger dbt models against Microsoft Fabric Spark via the Livy API.
+This document describes the stability, crash-resilience, and test-suite improvements made to the `dbt-fabricspark` adapter. These changes address runtime crashes, hangs, and resource leaks that occurred when running larger dbt models against Microsoft Fabric Spark via the Livy API, as well as fix all 26 pre-existing unit test failures.
 
 ---
 
 ## Root Cause Analysis
+
+### Adapter Crashes
 
 The adapter was crashing on larger models due to several compounding issues:
 
@@ -16,6 +18,20 @@ The adapter was crashing on larger models due to several compounding issues:
 4. **Missing error-state handling** — The statement polling loop (`_getLivyResult`) never checked for `error` or `cancelled` states, so a failed server-side statement would cause an infinite loop.
 5. **Bugs in cleanup code** — `delete_session` referenced an undefined `response.raise_for_status()` (the `urllib.response` module instead of the HTTP response variable), and `is_valid_session` crashed on HTTP failures instead of returning `False`.
 6. **Resource leaks** — `release()` was a no-op with a broken signature, `close()` silently swallowed exceptions, and `cleanup_all()` had a `self`/`cls` mismatch.
+
+### Test Suite Failures (26 tests)
+
+The full unit test suite was failing due to:
+
+1. **Missing `mp_context` argument** — `BaseAdapter.__init__()` in dbt-adapters ≥1.7 requires an `mp_context` (multiprocessing context) positional argument that tests were not providing.
+2. **Missing `spark_config`** — `FabricSparkCredentials.__post_init__()` requires `spark_config` to contain a `"name"` key, but test profiles and credential fixtures omitted it.
+3. **Wrong import path** — `test_adapter.py` imported `DbtRuntimeError` from `dbt.exceptions` instead of `dbt_common.exceptions` (moved in dbt-core ≥1.8).
+4. **Wrong mock target** — `test_livy_connection` mocked `LivySessionConnectionWrapper` but the real HTTP call happens in `LivySessionManager.connect`, so the mock didn't prevent a real connection attempt.
+5. **Mismatched method names in shortcut tests** — Tests called `check_exists()` but the real method is `check_if_exists_and_delete_shortcut()`. Target body assertions also missed the `"type": "OneLake"` key.
+6. **Broken macro template paths** — `test_macros.py` used relative `FileSystemLoader` paths (`dbt/include/...`) that only resolved if CWD happened to be the source root.
+7. **Missing Jinja globals** — Macros in `create_table_as.sql` reference `statement`, `is_incremental`, `local_md5`, and `alter_column_set_constraints` which were undefined in the isolated test Jinja environment.
+8. **Stray `unittest.skip()` call** — A bare `unittest.skip("Skipping temporarily")` at module level in `test_macros.py` did nothing (it's a decorator, not a statement).
+9. **`file_format_clause` suppressed `using delta`** — The `fabricspark__file_format_clause` macro had a `file_format != 'delta'` guard that prevented emitting `using delta`, contradicting the expected test output.
 
 ---
 
@@ -92,14 +108,60 @@ my_profile:
 
 ---
 
+### `create_table_as.sql`
+
+| Change | Detail |
+|--------|--------|
+| **`fabricspark__file_format_clause` — emit `using delta`** | Removed the `file_format != 'delta'` guard that suppressed emitting `using delta`. The clause now emits `using <file_format>` for all non-null formats including delta. |
+
+---
+
+## Test Suite Fixes
+
+### `test_adapter.py`
+
+| Change | Detail |
+|--------|--------|
+| **Added `mp_context` argument** | `FabricSparkAdapter(config)` → `FabricSparkAdapter(config, self.mp_context)` using `multiprocessing.get_context("spawn")`. Required by `BaseAdapter.__init__()` in dbt-adapters ≥1.7. |
+| **Fixed `DbtRuntimeError` import** | `from dbt.exceptions` → `from dbt_common.exceptions` (moved in dbt-core ≥1.8). |
+| **Added `spark_config` to test profiles** | Both `_get_target_livy` and `test_profile_with_database` profile dicts now include `"spark_config": {"name": "test-session"}` to satisfy `FabricSparkCredentials.__post_init__()` validation. |
+| **Fixed `test_livy_connection` mock** | Changed mock target from `LivySessionConnectionWrapper` to `LivySessionManager.connect` — the wrapper class was not where the real HTTP call occurs. |
+
+### `test_credentials.py`
+
+| Change | Detail |
+|--------|--------|
+| **Added `spark_config`** | Added `spark_config={"name": "test-session"}` to the `FabricSparkCredentials` constructor call. |
+
+### `test_macros.py`
+
+| Change | Detail |
+|--------|--------|
+| **Fixed template paths** | Replaced hardcoded relative paths with `os.path.dirname(__file__)`-based resolution so templates load regardless of CWD. |
+| **Removed stray `unittest.skip()`** | Removed the bare `unittest.skip("Skipping temporarily")` call at module level (a decorator applied to nothing). |
+| **Added missing Jinja globals** | Registered `statement`, `is_incremental`, `local_md5`, `alter_column_set_constraints`, `alter_table_add_constraints`, `get_assert_columns_equivalent`, `get_select_subquery`, and `create_temporary_view` as mocks/no-ops in `default_context` so the template parses without `UndefinedError`. |
+
+### `test_shortcuts.py`
+
+| Change | Detail |
+|--------|--------|
+| **Fixed method name mismatch** | Renamed all references from `check_exists` → `check_if_exists_and_delete_shortcut` to match the actual `ShortcutClient` method name. |
+| **Fixed target body assertions** | Added `"type": "OneLake"` to expected target dicts to match the actual `Shortcut.get_target_body()` return value. |
+| **Added `raise_for_status` mocks** | Added `mock_post.return_value.raise_for_status = mock.Mock()` (and similar for `get`/`delete`) since the real methods call `response.raise_for_status()`. |
+| **Mocked `time.sleep` in delete test** | The `delete_shortcut` method sleeps for 30 seconds — mocked to avoid slow tests. |
+| **Fixed re-creation assertions** | In mismatch tests, the subsequent `create_shortcut` call now mocks `check_if_exists_and_delete_shortcut` to return `False` so the POST actually fires. |
+
+---
+
 ## Backward Compatibility
 
 All changes are **fully backward-compatible**:
 
 - New credential fields have sensible defaults and are optional.
-- No changes to the SQL macro layer, relation model, or dbt contract interfaces.
+- No breaking changes to the SQL macro layer, relation model, or dbt contract interfaces.
 - Existing `profiles.yml` configurations work without modification.
 - The shared Livy session architecture is preserved (one session shared across threads), but now properly synchronized.
+- The `file_format_clause` change adds `using delta` to DDL statements — this is valid Spark SQL and matches the intended behavior asserted by the existing tests.
 
 ## Recommendations
 

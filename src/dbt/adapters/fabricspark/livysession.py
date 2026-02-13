@@ -48,7 +48,7 @@ def is_token_refresh_necessary(unixTimestamp: int) -> bool:
     # Calculate difference
     difference = dt_object - dt.datetime.fromtimestamp(time.mktime(local_time))
     if int(difference.total_seconds() / 60) < 5:
-        logger.debug(f"Token Refresh necessary in {int(difference.total_seconds() / 60)}")
+        logger.debug(f"Token refresh necessary in {int(difference.total_seconds() / 60)} minutes")
         return True
     else:
         return False
@@ -120,7 +120,12 @@ def get_default_access_token(credentials: FabricSparkCredentials) -> AccessToken
     return accessToken
 
 
-def get_headers(credentials: FabricSparkCredentials, tokenPrint: bool = False) -> dict[str, str]:
+def get_headers(credentials: FabricSparkCredentials) -> dict[str, str]:
+    """
+    Get HTTP headers with a valid Bearer token.
+
+    Tokens are never logged. Refresh is thread-safe.
+    """
     global accessToken
     with _token_lock:
         if accessToken is None or is_token_refresh_necessary(accessToken.expires_on):
@@ -137,9 +142,6 @@ def get_headers(credentials: FabricSparkCredentials, tokenPrint: bool = False) -
         token = accessToken.token
 
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-    if tokenPrint:
-        logger.debug(f"token is : {token}")
-
     return headers
 
 
@@ -181,7 +183,7 @@ class LivySession:
             response = requests.post(
                 self.connect_url + "/sessions",
                 data=json.dumps(data),
-                headers=get_headers(self.credential, False),
+                headers=get_headers(self.credential),
                 timeout=self.http_timeout,
             )
             if response.status_code == 200:
@@ -240,7 +242,7 @@ class LivySession:
             try:
                 http_res = requests.get(
                     self.connect_url + "/sessions/" + self.session_id,
-                    headers=get_headers(self.credential, False),
+                    headers=get_headers(self.credential),
                     timeout=self.http_timeout,
                 )
                 http_res.raise_for_status()
@@ -267,7 +269,7 @@ class LivySession:
                 )
                 time.sleep(self.poll_wait)
             elif livy_state == "idle":
-                logger.debug(f"New livy session id is: {self.session_id}, {res}")
+                logger.debug(f"Livy session {self.session_id} is idle and ready")
                 self.is_new_session_required = False
                 break
             elif livy_state in ("dead", "killed", "error"):
@@ -276,8 +278,6 @@ class LivySession:
                     f"Livy session {self.session_id} entered '{livy_state}' state: {error_msg}"
                 )
             else:
-                # Unknown or transitional state (e.g., "busy", "shutting_down")
-                # — sleep to avoid CPU burn, then continue polling
                 logger.debug(
                     f"Session {self.session_id} in state={state}, "
                     f"livyState={livy_state}. Waiting {self.poll_wait}s..."
@@ -288,7 +288,7 @@ class LivySession:
         try:
             res = requests.delete(
                 self.connect_url + "/sessions/" + self.session_id,
-                headers=get_headers(self.credential, False),
+                headers=get_headers(self.credential),
                 timeout=self.http_timeout,
             )
             if res.status_code == 200:
@@ -305,7 +305,7 @@ class LivySession:
         try:
             http_res = requests.get(
                 self.connect_url + "/sessions/" + self.session_id,
-                headers=get_headers(self.credential, False),
+                headers=get_headers(self.credential),
                 timeout=self.http_timeout,
             )
             http_res.raise_for_status()
@@ -314,7 +314,6 @@ class LivySession:
             logger.warning(f"Error checking session validity: {e}. Treating as invalid.")
             return False
 
-        # we can reuse the session so long as it is not dead, killed, or being shut down
         invalid_states = ["dead", "shutting_down", "killed", "error"]
         livy_state = res.get("livyInfo", {}).get("currentState", "unknown")
         return livy_state not in invalid_states
@@ -379,7 +378,7 @@ class LivyCursor:
             description = [
                 (
                     field["name"],
-                    field["type"],  # field['dataType'],
+                    field["type"],
                     None,
                     None,
                     None,
@@ -401,7 +400,7 @@ class LivyCursor:
         self._rows = None
         self._fetch_index = 0
 
-    def _submitLivyCode(self, code) -> Response:
+    def _submitLivyCode(self, code, max_retries=3) -> Response:
         if self.livy_session.is_new_session_required:
             LivySessionManager.connect(self.credential)
             self.session_id = self.livy_session.session_id
@@ -409,26 +408,40 @@ class LivyCursor:
         # Submit code
         data = {"code": code, "kind": "sql"}
         url = self.connect_url + "/sessions/" + self.session_id + "/statements"
-        logger.debug(f"Submitted: {data} {url}")
+        logger.debug(f"Submitting statement to {url}")
 
-        try:
-            res = requests.post(
-                url,
-                data=json.dumps(data),
-                headers=get_headers(self.credential, False),
-                timeout=self.http_timeout,
-            )
-            res.raise_for_status()
-        except requests.exceptions.Timeout as e:
-            raise DbtDatabaseError(
-                f"Timeout submitting statement to Livy (timeout={self.http_timeout}s): {e}"
-            ) from e
-        except requests.exceptions.RequestException as e:
-            raise DbtDatabaseError(
-                f"HTTP error submitting statement to Livy: {e}"
-            ) from e
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                res = requests.post(
+                    url,
+                    data=json.dumps(data),
+                    headers=get_headers(self.credential),
+                    timeout=self.http_timeout,
+                )
+                res.raise_for_status()
+                return res
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_err = e
+                if attempt < max_retries:
+                    wait = min(5 * attempt, 30)
+                    logger.warning(
+                        f"Transient error submitting statement (attempt {attempt}/{max_retries}): {e}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                else:
+                    raise DbtDatabaseError(
+                        f"Failed to submit statement after {max_retries} attempts: {e}"
+                    ) from e
+            except requests.exceptions.RequestException as e:
+                raise DbtDatabaseError(
+                    f"HTTP error submitting statement to Livy: {e}"
+                ) from e
 
-        return res
+        raise DbtDatabaseError(
+            f"Failed to submit statement after {max_retries} attempts: {last_err}"
+        ) from last_err
 
     def _getLivySQL(self, sql) -> str:
         code = re.sub(r"\s*/\*(.|\n)*?\*/\s*", "\n", sql, re.DOTALL).strip()
@@ -462,7 +475,7 @@ class LivyCursor:
             try:
                 http_res = requests.get(
                     url,
-                    headers=get_headers(self.credential, False),
+                    headers=get_headers(self.credential),
                     timeout=self.http_timeout,
                 )
                 http_res.raise_for_status()
@@ -493,7 +506,6 @@ class LivyCursor:
             elif state in ("waiting", "running"):
                 time.sleep(self.poll_statement_wait)
             else:
-                # Unknown state — sleep to avoid CPU burn
                 logger.debug(
                     f"Statement {statement_id} in state '{state}', "
                     f"waiting {self.poll_statement_wait}s..."
@@ -511,11 +523,6 @@ class LivyCursor:
         *parameters : Any
             The parameters.
 
-        Raises
-        ------
-        NotImplementedError
-            If there are parameters given. We do not format sql statements.
-
         Source
         ------
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#executesql-parameters
@@ -524,7 +531,7 @@ class LivyCursor:
             sql = sql % parameters
 
         res = self._getLivyResult(self._submitLivyCode(self._getLivySQL(sql)))
-        logger.debug(res)
+        logger.debug(f"Statement completed with status: {res.get('output', {}).get('status')}")
         if res["output"]["status"] == "ok":
             values = res["output"]["data"]["application/json"]
             if len(values) >= 1:
@@ -596,7 +603,7 @@ class LivyConnection:
         return self.session_id
 
     def get_headers(self) -> dict[str, str]:
-        return get_headers(self.credential, False)
+        return get_headers(self.credential)
 
     def get_connect_url(self) -> str:
         return self.connect_url
@@ -640,7 +647,6 @@ class LivySessionManager:
     @staticmethod
     def connect(credentials: FabricSparkCredentials) -> LivyConnection:
         with LivySessionManager._session_lock:
-            # the following opens a spark / sql session
             data = credentials.spark_config
             if LivySessionManager.livy_global_session is None:
                 LivySessionManager.livy_global_session = LivySession(credentials)
@@ -732,7 +738,7 @@ class LivySessionConnectionWrapper(object):
     @classmethod
     def _fix_binding(cls, value) -> float | str:
         """Convert complex datatypes to primitives that can be loaded by
-        the Spark driver"""
+        the Spark driver. Escapes strings to prevent SQL injection."""
         if isinstance(value, NUMBERS):
             return float(value)
         elif isinstance(value, dt.datetime):
@@ -740,4 +746,6 @@ class LivySessionConnectionWrapper(object):
         elif value is None:
             return "''"
         else:
-            return f"'{value}'"
+            # Escape backslashes and single quotes to prevent SQL injection
+            escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+            return f"'{escaped}'"

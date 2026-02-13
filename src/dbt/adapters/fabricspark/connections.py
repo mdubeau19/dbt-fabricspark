@@ -269,7 +269,7 @@ class FabricSparkConnectionManager(SQLConnectionManager):
         auto_begin: bool = True,
         bindings: Optional[Any] = None,
         abridge_sql_log: bool = False,
-        retryable_exceptions: Tuple[Type[Exception], ...] = tuple(),
+        retryable_exceptions: Tuple[Type[Exception], ...] = (DbtRuntimeError,),
         retry_limit: int = 2,
     ) -> Tuple[Connection, Any]:
         """
@@ -285,24 +285,22 @@ class FabricSparkConnectionManager(SQLConnectionManager):
             retry_limit: int,
             attempt: int,
         ):
-            """
-            A success sees the try exit cleanly and avoid any recursive
-            retries. Failure begins a sleep and retry routine.
-            """
             retry_limit = connection.credentials.connect_retries or 3
             try:
                 cursor.execute(sql, bindings)
             except retryable_exceptions as e:
-                # Cease retries and fail when limit is hit.
                 if attempt >= retry_limit:
                     raise e
 
+                wait = min(5 * (2 ** (attempt - 1)), 60)  # exponential backoff: 5, 10, 20, 40, 60
                 fire_event(
                     AdapterEventDebug(
-                        message=f"Got a retryable error {type(e)}. {retryable_limit-attempt} retries left. Retrying in 5 seconds.\nError:\n{e}"
+                        message=f"Got a retryable error {type(e)}. "
+                        f"{retry_limit - attempt} retries left. "
+                        f"Retrying in {wait} seconds.\nError:\n{e}"
                     )
                 )
-                time.sleep(5)
+                time.sleep(wait)
 
                 return _execute_query_with_retry(
                     cursor=cursor,

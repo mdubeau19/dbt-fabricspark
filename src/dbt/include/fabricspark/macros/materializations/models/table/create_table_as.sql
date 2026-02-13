@@ -39,7 +39,6 @@
     using {{ file_format }}
   {%- endif %}
 {%- endmacro -%}
-W
 {% macro tblproperties_clause() %}
   {{ return(adapter.dispatch('tblproperties_clause', 'dbt')()) }}
 {%- endmacro -%}
