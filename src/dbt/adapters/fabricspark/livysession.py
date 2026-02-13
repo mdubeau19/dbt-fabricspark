@@ -745,12 +745,19 @@ class LivySessionManager:
     @staticmethod
     def disconnect() -> None:
         with LivySessionManager._session_lock:
-            if (
-                LivySessionManager.livy_global_session is not None
-                and LivySessionManager.livy_global_session.is_valid_session()
-            ):
-                LivySessionManager.livy_global_session.delete_session()
-                LivySessionManager.livy_global_session.is_new_session_required = True
+            if LivySessionManager.livy_global_session is not None:
+                try:
+                    LivySessionManager.livy_global_session.delete_session()
+                except Exception as ex:
+                    logger.debug(f"Error during session cleanup (ignored): {ex}")
+                finally:
+                    LivySessionManager.livy_global_session.is_new_session_required = True
+                    # Close the HTTP session to release pooled connections
+                    try:
+                        LivySessionManager.livy_global_session.http_session.close()
+                    except Exception:
+                        pass
+                    LivySessionManager.livy_global_session = None
             else:
                 logger.debug("No session to disconnect")
 

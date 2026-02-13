@@ -211,11 +211,14 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
     @classmethod
     def cleanup_all(self) -> None:
-        for thread_id in self.connection_managers:
-            livySession = self.connection_managers[thread_id]
-            livySession.disconnect()
+        for thread_id in list(self.connection_managers.keys()):
+            try:
+                livySession = self.connection_managers[thread_id]
+                livySession.disconnect()
+            except Exception as ex:
+                logger.debug(f"Error cleaning up session for thread {thread_id}: {ex}")
 
-            # garbage collect these connections
+        # garbage collect these connections
         self.connection_managers.clear()
 
     @classmethod
