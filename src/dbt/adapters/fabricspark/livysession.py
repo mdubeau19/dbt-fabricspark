@@ -41,26 +41,29 @@ _token_lock = threading.Lock()
 accessToken: AccessToken = None
 
 
-def _build_http_session(max_retries: int = 3, backoff_factor: float = 1.0) -> requests.Session:
+def _build_http_session(max_retries: int = 5, backoff_factor: float = 1.0) -> requests.Session:
     """
     Build a requests.Session with transport-level retry and keep-alive.
 
     urllib3's Retry handles transient TCP/SSL errors (ConnectionError,
-    SSLError, etc.) *before* they reach application code, which is the
-    correct layer to recover from SSL EOF resets.
+    SSLError, etc.) *before* they reach application code.
     """
     session = requests.Session()
     retry_strategy = Retry(
         total=max_retries,
-        backoff_factor=backoff_factor,  # 1s, 2s, 4s, ...
+        backoff_factor=backoff_factor,  # 1s, 2s, 4s, 8s, 16s
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST", "DELETE"],
         raise_on_status=False,  # let us call raise_for_status() ourselves
+        connect=max_retries,  # retry on connection errors
+        read=max_retries,  # retry on read errors (includes SSL EOF)
+        other=max_retries,  # retry on other errors
     )
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
         pool_connections=4,
         pool_maxsize=4,
+        pool_block=False,
     )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -436,29 +439,39 @@ class LivyCursor:
             LivySessionManager.connect(self.credential)
             self.session_id = self.livy_session.session_id
 
-        # Submit code
         data = {"code": code, "kind": "sql"}
         url = self.connect_url + "/sessions/" + self.session_id + "/statements"
         logger.debug(f"Submitting statement to {url}")
 
-        try:
-            res = self.livy_session.http_session.post(
-                url,
-                data=json.dumps(data),
-                headers=get_headers(self.credential),
-                timeout=self.http_timeout,
-            )
-            res.raise_for_status()
-        except requests.exceptions.Timeout as e:
-            raise DbtDatabaseError(
-                f"Timeout submitting statement to Livy (timeout={self.http_timeout}s): {e}"
-            ) from e
-        except requests.exceptions.RequestException as e:
-            raise DbtDatabaseError(
-                f"HTTP error submitting statement to Livy: {e}"
-            ) from e
-
-        return res
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                res = self.livy_session.http_session.post(
+                    url,
+                    data=json.dumps(data),
+                    headers=get_headers(self.credential),
+                    timeout=self.http_timeout,
+                )
+                res.raise_for_status()
+                return res
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt >= max_retries:
+                    raise DbtDatabaseError(
+                        f"Failed to submit statement after {max_retries} attempts: {e}"
+                    ) from e
+                wait = min(5 * (2 ** (attempt - 1)), 60)
+                logger.warning(
+                    f"Connection error submitting statement (attempt {attempt}/{max_retries}): "
+                    f"{type(e).__name__}: {e}. Rebuilding HTTP session and retrying in {wait}s..."
+                )
+                # Rebuild the HTTP session to clear stale SSL connections
+                self.livy_session.http_session.close()
+                self.livy_session.http_session = _build_http_session(max_retries=3, backoff_factor=1.0)
+                time.sleep(wait)
+            except requests.exceptions.RequestException as e:
+                raise DbtDatabaseError(
+                    f"HTTP error submitting statement to Livy: {e}"
+                ) from e
 
     def _getLivySQL(self, sql) -> str:
         code = re.sub(r"\s*/\*(.|\n)*?\*/\s*", "\n", sql, re.DOTALL).strip()
@@ -482,6 +495,9 @@ class LivyCursor:
         )
 
         deadline = time.monotonic() + self.statement_timeout
+        consecutive_errors = 0
+        max_consecutive_errors = 10  # fail if we can't reach the API 10 times in a row
+
         while True:
             if time.monotonic() > deadline:
                 raise DbtDatabaseError(
@@ -497,7 +513,31 @@ class LivyCursor:
                 )
                 http_res.raise_for_status()
                 res = http_res.json()
+                consecutive_errors = 0  # reset on success
+            except requests.exceptions.ConnectionError as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    raise DbtDatabaseError(
+                        f"Lost connection polling statement {statement_id} after "
+                        f"{max_consecutive_errors} consecutive failures: {e}"
+                    ) from e
+                wait = min(5 * (2 ** (consecutive_errors - 1)), 60)
+                logger.warning(
+                    f"Connection error polling statement {statement_id} "
+                    f"(failure {consecutive_errors}/{max_consecutive_errors}): "
+                    f"{type(e).__name__}. Rebuilding HTTP session, retrying in {wait}s..."
+                )
+                self.livy_session.http_session.close()
+                self.livy_session.http_session = _build_http_session(max_retries=3, backoff_factor=1.0)
+                time.sleep(wait)
+                continue
             except requests.exceptions.RequestException as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    raise DbtDatabaseError(
+                        f"HTTP error polling statement {statement_id} after "
+                        f"{max_consecutive_errors} consecutive failures: {e}"
+                    ) from e
                 logger.warning(f"HTTP error polling statement {statement_id}: {e}. Retrying...")
                 time.sleep(self.poll_statement_wait)
                 continue
