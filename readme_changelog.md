@@ -1,8 +1,8 @@
-# dbt-fabricspark — Stability & Crash Resilience Changelog
+# dbt-fabricspark — Stability, Security & Crash Resilience Changelog
 
 ## Overview
 
-This document describes the stability, crash-resilience, and test-suite improvements made to the `dbt-fabricspark` adapter. These changes address runtime crashes, hangs, and resource leaks that occurred when running larger dbt models against Microsoft Fabric Spark via the Livy API, as well as fix all 26 pre-existing unit test failures.
+This document describes the stability, security, crash-resilience, and test-suite improvements made to the `dbt-fabricspark` adapter. These changes address runtime crashes, SSL connection failures, hangs, resource leaks, and security vulnerabilities that occurred when running dbt models against Microsoft Fabric Spark via the Livy API, as well as fix all 26 pre-existing unit test failures.
 
 ---
 
@@ -12,12 +12,23 @@ This document describes the stability, crash-resilience, and test-suite improvem
 
 The adapter was crashing on larger models due to several compounding issues:
 
-1. **Infinite polling loops** — Both `wait_for_session_start` and `_getLivyResult` used `while True` with no timeout or maximum iteration cap. If a Livy session or statement entered an unexpected state, the adapter would hang forever (or spin in a hot loop burning CPU).
+1. **Infinite polling loops** — Both `wait_for_session_start` and `_getLivyResult` used `while True` with no timeout or maximum iteration cap. If a Livy session or statement entered an unexpected state, the adapter would hang forever.
 2. **No HTTP request timeouts** — Every `requests.get/post/delete` call lacked a `timeout` parameter. If the Fabric API became slow or unresponsive, calls would block indefinitely.
 3. **Thread-unsafe shared state** — The global `accessToken` and class-level `LivySessionManager.livy_global_session` were mutated without any synchronization. Under dbt's parallel thread execution, this caused race conditions, duplicate session creation, and state corruption.
 4. **Missing error-state handling** — The statement polling loop (`_getLivyResult`) never checked for `error` or `cancelled` states, so a failed server-side statement would cause an infinite loop.
 5. **Bugs in cleanup code** — `delete_session` referenced an undefined `response.raise_for_status()` (the `urllib.response` module instead of the HTTP response variable), and `is_valid_session` crashed on HTTP failures instead of returning `False`.
 6. **Resource leaks** — `release()` was a no-op with a broken signature, `close()` silently swallowed exceptions, and `cleanup_all()` had a `self`/`cls` mismatch.
+
+### SSL EOF Errors on Large Models
+
+Large models (running 5+ minutes) consistently failed with `SSLEOFError: [SSL: UNEXPECTED_EOF_WHILE_READING]`. Root causes:
+
+1. **No connection pooling** — Every HTTP call used bare `requests.get()`/`requests.post()`, creating a new TCP/SSL connection each time. Stale connections were never cleaned up.
+2. **No transport-level retry** — When the Fabric API load balancer terminated idle SSL connections, the adapter had no mechanism to transparently reconnect.
+3. **No application-level retry on statement submission** — `_submitLivyCode` raised immediately on any connection error with no retry.
+4. **Stale connection pool reuse** — Even after adding `requests.Session`, the SSL connection pool held references to dead sockets. The pool needed to be rebuilt (not just retried) after SSL EOF.
+5. **Cleanup crash on SSL failure** — `disconnect()` called `is_valid_session()` which made an HTTP GET. When SSL was dead, this crashed and propagated up to dbt's `cleanup_connections()`, masking the real model error.
+6. **Wrong package installed** — The dbt project's `.venv` had a different (older) copy of the adapter than the workspace. Fixes in the workspace were never executed.
 
 ### Test Suite Failures (26 tests)
 
@@ -28,7 +39,7 @@ The full unit test suite was failing due to:
 3. **Wrong import path** — `test_adapter.py` imported `DbtRuntimeError` from `dbt.exceptions` instead of `dbt_common.exceptions` (moved in dbt-core ≥1.8).
 4. **Wrong mock target** — `test_livy_connection` mocked `LivySessionConnectionWrapper` but the real HTTP call happens in `LivySessionManager.connect`, so the mock didn't prevent a real connection attempt.
 5. **Mismatched method names in shortcut tests** — Tests called `check_exists()` but the real method is `check_if_exists_and_delete_shortcut()`. Target body assertions also missed the `"type": "OneLake"` key.
-6. **Broken macro template paths** — `test_macros.py` used relative `FileSystemLoader` paths (`dbt/include/...`) that only resolved if CWD happened to be the source root.
+6. **Broken macro template paths** — `test_macros.py` used relative `FileSystemLoader` paths that only resolved if CWD happened to be the source root.
 7. **Missing Jinja globals** — Macros in `create_table_as.sql` reference `statement`, `is_incremental`, `local_md5`, and `alter_column_set_constraints` which were undefined in the isolated test Jinja environment.
 8. **Stray `unittest.skip()` call** — A bare `unittest.skip("Skipping temporarily")` at module level in `test_macros.py` did nothing (it's a decorator, not a statement).
 9. **`file_format_clause` suppressed `using delta`** — The `fabricspark__file_format_clause` macro had a `file_format != 'delta'` guard that prevented emitting `using delta`, contradicting the expected test output.
@@ -39,6 +50,8 @@ The full unit test suite was failing due to:
 
 ### `credentials.py`
 
+#### Stability Fields
+
 | Change | Detail |
 |--------|--------|
 | Added `http_timeout` field | Configurable timeout (seconds) for each HTTP request to the Fabric API. Default: `120` |
@@ -47,7 +60,16 @@ The full unit test suite was failing due to:
 | Added `poll_wait` field | Seconds between polls when waiting for session start. Default: `10` |
 | Added `poll_statement_wait` field | Seconds between polls when waiting for statement result. Default: `5` |
 
-All new fields are optional and backward-compatible — existing `profiles.yml` configurations will use the defaults.
+#### Security Hardening
+
+| Change | Detail |
+|--------|--------|
+| **UUID validation** | Added `_UUID_PATTERN` regex and `_validate_uuid()` method. `workspaceid` and `lakehouseid` are validated in `__post_init__()` to prevent path traversal attacks via crafted GUIDs. |
+| **Endpoint validation** | Added `_ALLOWED_FABRIC_DOMAINS` allowlist and `_validate_endpoint()` method. Enforces HTTPS scheme. Warns on unknown domains to prevent bearer token leakage to untrusted hosts. |
+| **`__repr__` masking** | Overrides `__repr__` to mask `client_secret` and `accessToken` as `'***'` in logs and tracebacks. |
+| **`_connection_keys` tightened** | Intentionally excludes `client_secret`, `accessToken`, and `tenant_id` from connection keys to prevent credential exposure. |
+
+All new fields are optional and backward-compatible.
 
 **Example `profiles.yml` usage:**
 
