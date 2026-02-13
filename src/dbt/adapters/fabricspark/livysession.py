@@ -3,10 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import threading
 import time
 from types import TracebackType
 from typing import Any
-from urllib import response
 
 import requests
 from azure.core.credentials import AccessToken
@@ -25,9 +25,17 @@ NUMBERS = DECIMALS + (int, float)
 
 livysession_credentials: FabricSparkCredentials
 
+# Default timeouts (used as fallbacks when credentials don't specify values)
 DEFAULT_POLL_WAIT = 10
 DEFAULT_POLL_STATEMENT_WAIT = 5
+DEFAULT_HTTP_TIMEOUT = 120  # seconds
+DEFAULT_SESSION_START_TIMEOUT = 600  # 10 minutes
+DEFAULT_STATEMENT_TIMEOUT = 3600  # 1 hour
+
 AZURE_CREDENTIAL_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
+
+# Thread-safe access token management
+_token_lock = threading.Lock()
 accessToken: AccessToken = None
 
 
@@ -48,7 +56,7 @@ def is_token_refresh_necessary(unixTimestamp: int) -> bool:
 
 def get_cli_access_token(credentials: FabricSparkCredentials) -> AccessToken:
     """
-    Get an Azure access token using the CLI credentials
+    Get an Azure access token using the CLI credentials.
 
     First login with:
 
@@ -58,7 +66,7 @@ def get_cli_access_token(credentials: FabricSparkCredentials) -> AccessToken:
 
     Parameters
     ----------
-    credentials: FabricConnectionManager
+    credentials: FabricSparkCredentials
         The credentials.
 
     Returns
@@ -77,7 +85,7 @@ def get_sp_access_token(credentials: FabricSparkCredentials) -> AccessToken:
 
     Parameters
     ----------
-    credentials : FabricCredentials
+    credentials : FabricSparkCredentials
         Credentials.
 
     Returns
@@ -97,7 +105,7 @@ def get_default_access_token(credentials: FabricSparkCredentials) -> AccessToken
 
     Parameters
     ----------
-    credentials : FabricCredentials
+    credentials : FabricSparkCredentials
         Credentials.
 
     Returns
@@ -114,20 +122,23 @@ def get_default_access_token(credentials: FabricSparkCredentials) -> AccessToken
 
 def get_headers(credentials: FabricSparkCredentials, tokenPrint: bool = False) -> dict[str, str]:
     global accessToken
-    if accessToken is None or is_token_refresh_necessary(accessToken.expires_on):
-        if credentials.authentication and credentials.authentication.lower() == "cli":
-            logger.info("Using CLI auth")
-            accessToken = get_cli_access_token(credentials)
-        elif credentials.authentication and credentials.authentication.lower() == "int_tests":
-            logger.info("Using int_tests auth")
-            accessToken = get_default_access_token(credentials)
-        else:
-            logger.info("Using SPN auth")
-            accessToken = get_sp_access_token(credentials)
+    with _token_lock:
+        if accessToken is None or is_token_refresh_necessary(accessToken.expires_on):
+            if credentials.authentication and credentials.authentication.lower() == "cli":
+                logger.info("Using CLI auth")
+                accessToken = get_cli_access_token(credentials)
+            elif credentials.authentication and credentials.authentication.lower() == "int_tests":
+                logger.info("Using int_tests auth")
+                accessToken = get_default_access_token(credentials)
+            else:
+                logger.info("Using SPN auth")
+                accessToken = get_sp_access_token(credentials)
 
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {accessToken.token}"}
+        token = accessToken.token
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
     if tokenPrint:
-        logger.debug(f"token is : {accessToken.token}")
+        logger.debug(f"token is : {token}")
 
     return headers
 
@@ -138,6 +149,18 @@ class LivySession:
         self.connect_url = credentials.lakehouse_endpoint
         self.session_id = None
         self.is_new_session_required = True
+        # Read timeouts from credentials with fallback defaults
+        self.http_timeout = getattr(credentials, "http_timeout", DEFAULT_HTTP_TIMEOUT)
+        self.session_start_timeout = getattr(
+            credentials, "session_start_timeout", DEFAULT_SESSION_START_TIMEOUT
+        )
+        self.statement_timeout = getattr(
+            credentials, "statement_timeout", DEFAULT_STATEMENT_TIMEOUT
+        )
+        self.poll_wait = getattr(credentials, "poll_wait", DEFAULT_POLL_WAIT)
+        self.poll_statement_wait = getattr(
+            credentials, "poll_statement_wait", DEFAULT_POLL_STATEMENT_WAIT
+        )
 
     def __enter__(self) -> LivySession:
         return self
@@ -159,29 +182,44 @@ class LivySession:
                 self.connect_url + "/sessions",
                 data=json.dumps(data),
                 headers=get_headers(self.credential, False),
+                timeout=self.http_timeout,
             )
             if response.status_code == 200:
                 logger.debug("Initiated Livy Session...")
             response.raise_for_status()
         except requests.exceptions.ConnectionError as c_err:
-            raise Exception("Connection Error :", c_err.response.json())
+            raise FailedToConnectError(
+                f"Connection Error creating Livy session: {c_err}"
+            ) from c_err
         except requests.exceptions.HTTPError as h_err:
-            raise Exception("Http Error: ", h_err.response.json())
+            raise FailedToConnectError(
+                f"HTTP Error creating Livy session: {h_err}"
+            ) from h_err
         except requests.exceptions.Timeout as t_err:
-            raise Exception("Timeout Error: ", t_err.response.json())
+            raise FailedToConnectError(
+                f"Timeout creating Livy session (timeout={self.http_timeout}s): {t_err}"
+            ) from t_err
         except requests.exceptions.RequestException as a_err:
-            raise Exception("Authorization Error: ", a_err.response.json())
+            raise FailedToConnectError(
+                f"Request Error creating Livy session: {a_err}"
+            ) from a_err
+        except FailedToConnectError:
+            raise
         except Exception as ex:
-            raise Exception(ex) from ex
+            raise FailedToConnectError(
+                f"Unexpected error creating Livy session: {ex}"
+            ) from ex
 
         if response is None:
-            raise Exception("Invalid response from Livy server")
+            raise FailedToConnectError("Invalid response from Livy server")
 
         self.session_id = None
         try:
             self.session_id = str(response.json()["id"])
-        except requests.exceptions.JSONDecodeError as json_err:
-            raise Exception("Json decode error to get session_id") from json_err
+        except (requests.exceptions.JSONDecodeError, KeyError) as json_err:
+            raise FailedToConnectError(
+                "Failed to parse session_id from Livy response"
+            ) from json_err
 
         # Wait for the session to start
         self.wait_for_session_start()
@@ -190,35 +228,73 @@ class LivySession:
         return self.session_id
 
     def wait_for_session_start(self) -> None:
-        """Wait for the Livy session to reach the 'idle' state."""
+        """Wait for the Livy session to reach the 'idle' state, with a timeout."""
+        deadline = time.monotonic() + self.session_start_timeout
         while True:
-            res = requests.get(
-                self.connect_url + "/sessions/" + self.session_id,
-                headers=get_headers(self.credential, False),
-            ).json()
-            if res["state"] == "starting" or res["state"] == "not_started":
-                time.sleep(DEFAULT_POLL_WAIT)
-            elif res["livyInfo"]["currentState"] == "idle":
+            if time.monotonic() > deadline:
+                raise FailedToConnectError(
+                    f"Livy session {self.session_id} did not start within "
+                    f"{self.session_start_timeout} seconds"
+                )
+
+            try:
+                http_res = requests.get(
+                    self.connect_url + "/sessions/" + self.session_id,
+                    headers=get_headers(self.credential, False),
+                    timeout=self.http_timeout,
+                )
+                http_res.raise_for_status()
+                res = http_res.json()
+            except requests.exceptions.RequestException as e:
+                logger.warning(
+                    f"HTTP error polling session {self.session_id} status: {e}. Retrying..."
+                )
+                time.sleep(self.poll_wait)
+                continue
+            except (ValueError, KeyError) as e:
+                logger.warning(
+                    f"Error parsing session status response: {e}. Retrying..."
+                )
+                time.sleep(self.poll_wait)
+                continue
+
+            state = res.get("state", "unknown")
+            livy_state = res.get("livyInfo", {}).get("currentState", "unknown")
+
+            if state in ("starting", "not_started"):
+                logger.debug(
+                    f"Session {self.session_id} state={state}, waiting {self.poll_wait}s..."
+                )
+                time.sleep(self.poll_wait)
+            elif livy_state == "idle":
                 logger.debug(f"New livy session id is: {self.session_id}, {res}")
                 self.is_new_session_required = False
                 break
-            elif res["livyInfo"]["currentState"] == "dead":
-                logger.error("ERROR, cannot create a livy session")
-                raise FailedToConnectError("failed to connect")
+            elif livy_state in ("dead", "killed", "error"):
+                error_msg = res.get("livyInfo", {}).get("errorMessage", "No error details")
+                raise FailedToConnectError(
+                    f"Livy session {self.session_id} entered '{livy_state}' state: {error_msg}"
+                )
+            else:
+                # Unknown or transitional state (e.g., "busy", "shutting_down")
+                # — sleep to avoid CPU burn, then continue polling
+                logger.debug(
+                    f"Session {self.session_id} in state={state}, "
+                    f"livyState={livy_state}. Waiting {self.poll_wait}s..."
+                )
+                time.sleep(self.poll_wait)
 
     def delete_session(self) -> None:
-
         try:
-            # delete the session_id
-            _ = requests.delete(
+            res = requests.delete(
                 self.connect_url + "/sessions/" + self.session_id,
                 headers=get_headers(self.credential, False),
+                timeout=self.http_timeout,
             )
-            if _.status_code == 200:
+            if res.status_code == 200:
                 logger.debug(f"Closed the livy session: {self.session_id}")
             else:
-                response.raise_for_status()
-
+                res.raise_for_status()
         except Exception as ex:
             logger.error(f"Unable to close the livy session {self.session_id}, error: {ex}")
 
@@ -226,14 +302,22 @@ class LivySession:
         if self.session_id is None:
             logger.error("Session ID is None")
             return False
-        res = requests.get(
-            self.connect_url + "/sessions/" + self.session_id,
-            headers=get_headers(self.credential, False),
-        ).json()
+        try:
+            http_res = requests.get(
+                self.connect_url + "/sessions/" + self.session_id,
+                headers=get_headers(self.credential, False),
+                timeout=self.http_timeout,
+            )
+            http_res.raise_for_status()
+            res = http_res.json()
+        except Exception as e:
+            logger.warning(f"Error checking session validity: {e}. Treating as invalid.")
+            return False
 
         # we can reuse the session so long as it is not dead, killed, or being shut down
-        invalid_states = ["dead", "shutting_down", "killed"]
-        return res["livyInfo"]["currentState"] not in invalid_states
+        invalid_states = ["dead", "shutting_down", "killed", "error"]
+        livy_state = res.get("livyInfo", {}).get("currentState", "unknown")
+        return livy_state not in invalid_states
 
 
 # cursor object - wrapped for livy API
@@ -249,10 +333,17 @@ class LivyCursor:
     def __init__(self, credential, livy_session) -> None:
         self._rows = None
         self._schema = None
+        self._fetch_index = 0
         self.credential = credential
         self.connect_url = credential.lakehouse_endpoint
         self.session_id = livy_session.session_id
         self.livy_session = livy_session
+        # Read timeouts from credentials
+        self.http_timeout = getattr(credential, "http_timeout", DEFAULT_HTTP_TIMEOUT)
+        self.statement_timeout = getattr(credential, "statement_timeout", DEFAULT_STATEMENT_TIMEOUT)
+        self.poll_statement_wait = getattr(
+            credential, "poll_statement_wait", DEFAULT_POLL_STATEMENT_WAIT
+        )
 
     def __enter__(self) -> LivyCursor:
         return self
@@ -308,6 +399,7 @@ class LivyCursor:
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#close
         """
         self._rows = None
+        self._fetch_index = 0
 
     def _submitLivyCode(self, code) -> Response:
         if self.livy_session.is_new_session_required:
@@ -316,41 +408,97 @@ class LivyCursor:
 
         # Submit code
         data = {"code": code, "kind": "sql"}
-        logger.debug(
-            f"Submitted: {data} {self.connect_url + '/sessions/' + self.session_id + '/statements'}"
-        )
-        res = requests.post(
-            self.connect_url + "/sessions/" + self.session_id + "/statements",
-            data=json.dumps(data),
-            headers=get_headers(self.credential, False),
-        )
+        url = self.connect_url + "/sessions/" + self.session_id + "/statements"
+        logger.debug(f"Submitted: {data} {url}")
+
+        try:
+            res = requests.post(
+                url,
+                data=json.dumps(data),
+                headers=get_headers(self.credential, False),
+                timeout=self.http_timeout,
+            )
+            res.raise_for_status()
+        except requests.exceptions.Timeout as e:
+            raise DbtDatabaseError(
+                f"Timeout submitting statement to Livy (timeout={self.http_timeout}s): {e}"
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise DbtDatabaseError(
+                f"HTTP error submitting statement to Livy: {e}"
+            ) from e
+
         return res
 
     def _getLivySQL(self, sql) -> str:
-        # Comment, what is going on?!
-        # The following code is actually injecting SQL to pyspark object for executing it via the Livy session - over an HTTP post request.
-        # Basically, it is like code inside a code. As a result the strings passed here in 'escapedSQL' variable are unescapted and interpreted on the server side.
-        # This may have repurcursions of code injection not only as SQL, but also arbritary Python code. An alternate way safer way to acheive this is still unknown.
-        # TODO: since the above code is not changed to sending direct SQL to the livy backend, client side string escaping is probably not needed
-
         code = re.sub(r"\s*/\*(.|\n)*?\*/\s*", "\n", sql, re.DOTALL).strip()
         return code
 
     def _getLivyResult(self, res_obj) -> Response:
-        json_res = res_obj.json()
-        while True:
-            res = requests.get(
-                self.connect_url
-                + "/sessions/"
-                + self.session_id
-                + "/statements/"
-                + repr(json_res["id"]),
-                headers=get_headers(self.credential, False),
-            ).json()
+        try:
+            json_res = res_obj.json()
+        except (ValueError, KeyError) as e:
+            raise DbtDatabaseError(
+                f"Failed to parse statement submission response: {e}"
+            ) from e
 
-            if res["state"] == "available":
+        statement_id = repr(json_res["id"])
+        url = (
+            self.connect_url
+            + "/sessions/"
+            + self.session_id
+            + "/statements/"
+            + statement_id
+        )
+
+        deadline = time.monotonic() + self.statement_timeout
+        while True:
+            if time.monotonic() > deadline:
+                raise DbtDatabaseError(
+                    f"Statement {statement_id} did not complete within "
+                    f"{self.statement_timeout} seconds"
+                )
+
+            try:
+                http_res = requests.get(
+                    url,
+                    headers=get_headers(self.credential, False),
+                    timeout=self.http_timeout,
+                )
+                http_res.raise_for_status()
+                res = http_res.json()
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"HTTP error polling statement {statement_id}: {e}. Retrying...")
+                time.sleep(self.poll_statement_wait)
+                continue
+            except (ValueError, KeyError) as e:
+                logger.warning(
+                    f"Error parsing statement poll response: {e}. Retrying..."
+                )
+                time.sleep(self.poll_statement_wait)
+                continue
+
+            state = res.get("state", "unknown")
+
+            if state == "available":
                 return res
-            time.sleep(DEFAULT_POLL_STATEMENT_WAIT)
+            elif state in ("error", "cancelled", "cancelling"):
+                error_info = res.get("output", {})
+                error_msg = error_info.get("evalue", "No error details available")
+                traceback = error_info.get("traceback", [])
+                raise DbtDatabaseError(
+                    f"Statement {statement_id} failed with state '{state}': "
+                    f"{error_msg}\n{''.join(traceback)}"
+                )
+            elif state in ("waiting", "running"):
+                time.sleep(self.poll_statement_wait)
+            else:
+                # Unknown state — sleep to avoid CPU burn
+                logger.debug(
+                    f"Statement {statement_id} in state '{state}', "
+                    f"waiting {self.poll_statement_wait}s..."
+                )
+                time.sleep(self.poll_statement_wait)
 
     def execute(self, sql: str, *parameters: Any) -> None:
         """
@@ -375,15 +523,13 @@ class LivyCursor:
         if len(parameters) > 0:
             sql = sql % parameters
 
-        # TODO: handle parameterised sql
-
         res = self._getLivyResult(self._submitLivyCode(self._getLivySQL(sql)))
         logger.debug(res)
         if res["output"]["status"] == "ok":
             values = res["output"]["data"]["application/json"]
             if len(values) >= 1:
-                self._rows = values["data"]  # values[0]['values']
-                self._schema = values["schema"]["fields"]  # values[0]['schema']
+                self._rows = values["data"]
+                self._schema = values["schema"]["fields"]
             else:
                 self._rows = []
                 self._schema = []
@@ -392,6 +538,8 @@ class LivyCursor:
             self._schema = None
 
             raise DbtDatabaseError("Error while executing query: " + res["output"]["evalue"])
+
+        self._fetch_index = 0
 
     def fetchall(self):
         """
@@ -410,24 +558,22 @@ class LivyCursor:
 
     def fetchone(self):
         """
-        Fetch the first output.
+        Fetch the next row.
 
         Returns
         -------
         out : one row | None
-            The first row.
+            The next row, or None if exhausted.
 
         Source
         ------
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#fetchone
         """
-
-        if self._rows is not None and len(self._rows) > 0:
-            row = self._rows.pop(0)
-        else:
-            row = None
-
-        return row
+        if self._rows is not None and self._fetch_index < len(self._rows):
+            row = self._rows[self._fetch_index]
+            self._fetch_index += 1
+            return row
+        return None
 
 
 class LivyConnection:
@@ -487,56 +633,67 @@ class LivyConnection:
         return True
 
 
-# TODO: How to authenticate
 class LivySessionManager:
     livy_global_session = None
+    _session_lock = threading.Lock()
 
     @staticmethod
     def connect(credentials: FabricSparkCredentials) -> LivyConnection:
-        # the following opens an spark / sql session
-        data = credentials.spark_config
-        if LivySessionManager.livy_global_session is None:
-            LivySessionManager.livy_global_session = LivySession(credentials)
-            LivySessionManager.livy_global_session.create_session(data)
-            LivySessionManager.livy_global_session.is_new_session_required = False
-            # create shortcuts, if there are any
-            if credentials.create_shortcuts:
+        with LivySessionManager._session_lock:
+            # the following opens a spark / sql session
+            data = credentials.spark_config
+            if LivySessionManager.livy_global_session is None:
+                LivySessionManager.livy_global_session = LivySession(credentials)
+                LivySessionManager.livy_global_session.create_session(data)
+                LivySessionManager.livy_global_session.is_new_session_required = False
+                # create shortcuts, if there are any
+                if credentials.create_shortcuts:
+                    try:
+                        shortcut_client = ShortcutClient(
+                            accessToken.token,
+                            credentials.workspaceid,
+                            credentials.lakehouseid,
+                            credentials.endpoint,
+                        )
+                        shortcut_client.create_shortcuts(credentials.shortcuts_json_str)
+                    except Exception as ex:
+                        logger.error(f"Unable to create shortcuts: {ex}")
+            elif not LivySessionManager.livy_global_session.is_valid_session():
+                logger.debug("Existing session is invalid, creating a new one...")
                 try:
-                    shortcut_client = ShortcutClient(
-                        accessToken.token,
-                        credentials.workspaceid,
-                        credentials.lakehouseid,
-                        credentials.endpoint,
-                    )
-                    shortcut_client.create_shortcuts(credentials.shortcuts_json_str)
+                    LivySessionManager.livy_global_session.delete_session()
                 except Exception as ex:
-                    logger.error(f"Unable to create shortcuts: {ex}")
-        elif not LivySessionManager.livy_global_session.is_valid_session():
-            LivySessionManager.livy_global_session.delete_session()
-            LivySessionManager.livy_global_session.create_session(data)
-            LivySessionManager.livy_global_session.is_new_session_required = False
-        elif LivySessionManager.livy_global_session.is_new_session_required:
-            LivySessionManager.livy_global_session.create_session(data)
-            LivySessionManager.livy_global_session.is_new_session_required = False
-        else:
-            logger.debug(f"Reusing session: {LivySessionManager.livy_global_session.session_id}")
-        livyConnection = LivyConnection(credentials, LivySessionManager.livy_global_session)
+                    logger.debug(f"Error cleaning up old session: {ex}")
+                LivySessionManager.livy_global_session = LivySession(credentials)
+                LivySessionManager.livy_global_session.create_session(data)
+                LivySessionManager.livy_global_session.is_new_session_required = False
+            elif LivySessionManager.livy_global_session.is_new_session_required:
+                LivySessionManager.livy_global_session.create_session(data)
+                LivySessionManager.livy_global_session.is_new_session_required = False
+            else:
+                logger.debug(
+                    f"Reusing session: {LivySessionManager.livy_global_session.session_id}"
+                )
+            livyConnection = LivyConnection(
+                credentials, LivySessionManager.livy_global_session
+            )
         return livyConnection
 
     @staticmethod
     def disconnect() -> None:
-        if (
-            LivySessionManager.livy_global_session is not None
-            and LivySessionManager.livy_global_session.is_valid_session()
-        ):
-            LivySessionManager.livy_global_session.delete_session()
-            LivySessionManager.livy_global_session.is_new_session_required = True
-        else:
-            logger.debug("No session to disconnect")
+        with LivySessionManager._session_lock:
+            if (
+                LivySessionManager.livy_global_session is not None
+                and LivySessionManager.livy_global_session.is_valid_session()
+            ):
+                LivySessionManager.livy_global_session.delete_session()
+                LivySessionManager.livy_global_session.is_new_session_required = True
+            else:
+                logger.debug("No session to disconnect")
 
 
 class LivySessionConnectionWrapper(object):
-    """Connection wrapper for the livy sessoin connection method."""
+    """Connection wrapper for the livy session connection method."""
 
     def __init__(self, handle):
         self.handle = handle

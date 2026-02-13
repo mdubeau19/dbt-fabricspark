@@ -31,6 +31,13 @@ class FabricSparkCredentials(Credentials):
     accessToken: Optional[str] = None
     spark_config: Dict[str, Any] = field(default_factory=dict)
 
+    # Livy session stability settings
+    http_timeout: int = 120  # seconds for each HTTP request to Fabric API
+    session_start_timeout: int = 600  # max seconds to wait for session start (10 min)
+    statement_timeout: int = 3600  # max seconds to wait for a statement result (1 hour)
+    poll_wait: int = 10  # seconds between polls for session start
+    poll_statement_wait: int = 5  # seconds between polls for statement result
+
     @classmethod
     def __pre_deserialize__(cls, data: Any) -> Any:
         data = super().__pre_deserialize__(data)
