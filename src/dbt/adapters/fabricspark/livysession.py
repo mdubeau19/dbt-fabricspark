@@ -13,7 +13,9 @@ from azure.core.credentials import AccessToken
 from azure.identity import AzureCliCredential, ClientSecretCredential
 from dbt_common.exceptions import DbtDatabaseError
 from dbt_common.utils.encoding import DECIMALS
+from requests.adapters import HTTPAdapter
 from requests.models import Response
+from urllib3.util.retry import Retry
 
 from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.exceptions import FailedToConnectError
@@ -37,6 +39,32 @@ AZURE_CREDENTIAL_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
 # Thread-safe access token management
 _token_lock = threading.Lock()
 accessToken: AccessToken = None
+
+
+def _build_http_session(max_retries: int = 3, backoff_factor: float = 1.0) -> requests.Session:
+    """
+    Build a requests.Session with transport-level retry and keep-alive.
+
+    urllib3's Retry handles transient TCP/SSL errors (ConnectionError,
+    SSLError, etc.) *before* they reach application code, which is the
+    correct layer to recover from SSL EOF resets.
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=max_retries,
+        backoff_factor=backoff_factor,  # 1s, 2s, 4s, ...
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST", "DELETE"],
+        raise_on_status=False,  # let us call raise_for_status() ourselves
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=4,
+        pool_maxsize=4,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def is_token_refresh_necessary(unixTimestamp: int) -> bool:
@@ -163,6 +191,8 @@ class LivySession:
         self.poll_statement_wait = getattr(
             credentials, "poll_statement_wait", DEFAULT_POLL_STATEMENT_WAIT
         )
+        # Shared HTTP session with connection pooling and transport-level retry
+        self.http_session = _build_http_session(max_retries=3, backoff_factor=1.0)
 
     def __enter__(self) -> LivySession:
         return self
@@ -173,6 +203,7 @@ class LivySession:
         exc_val: Exception | None,
         exc_tb: TracebackType | None,
     ) -> bool:
+        self.http_session.close()
         return True
 
     def create_session(self, data) -> str:
@@ -180,7 +211,7 @@ class LivySession:
         response = None
         logger.debug("Creating Livy session (this may take a few minutes)")
         try:
-            response = requests.post(
+            response = self.http_session.post(
                 self.connect_url + "/sessions",
                 data=json.dumps(data),
                 headers=get_headers(self.credential),
@@ -240,7 +271,7 @@ class LivySession:
                 )
 
             try:
-                http_res = requests.get(
+                http_res = self.http_session.get(
                     self.connect_url + "/sessions/" + self.session_id,
                     headers=get_headers(self.credential),
                     timeout=self.http_timeout,
@@ -286,7 +317,7 @@ class LivySession:
 
     def delete_session(self) -> None:
         try:
-            res = requests.delete(
+            res = self.http_session.delete(
                 self.connect_url + "/sessions/" + self.session_id,
                 headers=get_headers(self.credential),
                 timeout=self.http_timeout,
@@ -303,7 +334,7 @@ class LivySession:
             logger.error("Session ID is None")
             return False
         try:
-            http_res = requests.get(
+            http_res = self.http_session.get(
                 self.connect_url + "/sessions/" + self.session_id,
                 headers=get_headers(self.credential),
                 timeout=self.http_timeout,
@@ -400,7 +431,7 @@ class LivyCursor:
         self._rows = None
         self._fetch_index = 0
 
-    def _submitLivyCode(self, code, max_retries=3) -> Response:
+    def _submitLivyCode(self, code) -> Response:
         if self.livy_session.is_new_session_required:
             LivySessionManager.connect(self.credential)
             self.session_id = self.livy_session.session_id
@@ -410,38 +441,24 @@ class LivyCursor:
         url = self.connect_url + "/sessions/" + self.session_id + "/statements"
         logger.debug(f"Submitting statement to {url}")
 
-        last_err = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                res = requests.post(
-                    url,
-                    data=json.dumps(data),
-                    headers=get_headers(self.credential),
-                    timeout=self.http_timeout,
-                )
-                res.raise_for_status()
-                return res
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                last_err = e
-                if attempt < max_retries:
-                    wait = min(5 * attempt, 30)
-                    logger.warning(
-                        f"Transient error submitting statement (attempt {attempt}/{max_retries}): {e}. "
-                        f"Retrying in {wait}s..."
-                    )
-                    time.sleep(wait)
-                else:
-                    raise DbtDatabaseError(
-                        f"Failed to submit statement after {max_retries} attempts: {e}"
-                    ) from e
-            except requests.exceptions.RequestException as e:
-                raise DbtDatabaseError(
-                    f"HTTP error submitting statement to Livy: {e}"
-                ) from e
+        try:
+            res = self.livy_session.http_session.post(
+                url,
+                data=json.dumps(data),
+                headers=get_headers(self.credential),
+                timeout=self.http_timeout,
+            )
+            res.raise_for_status()
+        except requests.exceptions.Timeout as e:
+            raise DbtDatabaseError(
+                f"Timeout submitting statement to Livy (timeout={self.http_timeout}s): {e}"
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise DbtDatabaseError(
+                f"HTTP error submitting statement to Livy: {e}"
+            ) from e
 
-        raise DbtDatabaseError(
-            f"Failed to submit statement after {max_retries} attempts: {last_err}"
-        ) from last_err
+        return res
 
     def _getLivySQL(self, sql) -> str:
         code = re.sub(r"\s*/\*(.|\n)*?\*/\s*", "\n", sql, re.DOTALL).strip()
@@ -473,7 +490,7 @@ class LivyCursor:
                 )
 
             try:
-                http_res = requests.get(
+                http_res = self.livy_session.http_session.get(
                     url,
                     headers=get_headers(self.credential),
                     timeout=self.http_timeout,
